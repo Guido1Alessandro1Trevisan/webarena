@@ -2,7 +2,7 @@ gymnasium
 playwright==1.52.0 
 Pillow
 evaluate
-openai==0.27.0
+openai
 types-tqdm
 tiktoken
 aiolimiter
