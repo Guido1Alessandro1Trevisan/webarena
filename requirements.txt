@@ -1,5 +1,4 @@
 gymnasium
-playwright==1.52.0 
 Pillow
 evaluate
 openai
