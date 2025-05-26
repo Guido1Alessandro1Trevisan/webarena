@@ -11,6 +11,10 @@ import time
 from pathlib import Path
 
 import openai
+try:
+    from openai import error as openai_error  # type: ignore
+except Exception:  # pragma: no cover - fallback for new SDK
+    openai_error = openai  # type: ignore
 
 from agent import (
     Agent,
@@ -347,7 +351,7 @@ def test(
                     Path(args.result_dir) / "traces" / f"{task_id}.zip"
                 )
 
-        except openai.error.OpenAIError as e:
+        except openai_error.OpenAIError as e:
             logger.info(f"[OpenAI Error] {repr(e)}")
         except Exception as e:
             logger.info(f"[Unhandled Error] {repr(e)}]")
