@@ -1,8 +1,5 @@
-"""Base classes and helpers for evaluation on WebArena benchmarks."""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Imports
-# ─────────────────────────────────────────────────────────────────────────────
+"""base class for evaluation"""
+# answer string match
 import collections
 import html
 import importlib
@@ -10,14 +7,11 @@ import json
 import time
 import urllib
 from pathlib import Path
-from typing import Union
+from typing import Any, Tuple, Union
 
 from beartype import beartype
-from nltk.tokenize import word_tokenize        # type: ignore
-
-# Play-wright ─ we need BOTH sync *and* async flavours
-from playwright.sync_api import CDPSession as SyncCDP, Page as SyncPage
-from playwright.async_api import CDPSession as AsyncCDP, Page as AsyncPage
+from nltk.tokenize import word_tokenize  # type: ignore
+from playwright.sync_api import CDPSession, Page
 
 from browser_env.actions import Action
 from browser_env.utils import StateInfo
@@ -32,63 +26,55 @@ from evaluation_harness.helper_functions import (
     shopping_get_sku_latest_review_rating,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Type aliases that satisfy beartype for BOTH sync and async Playwright APIs
-# ─────────────────────────────────────────────────────────────────────────────
-PageLike = Union[SyncPage, AsyncPage, PseudoPage]
-CDPSessionLike = Union[SyncCDP, AsyncCDP]
 Trajectory = list[Union[Action, StateInfo]]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Evaluator base-class
-# ─────────────────────────────────────────────────────────────────────────────
-class Evaluator:
+
+class Evaluator(object):
     def __init__(self, eval_tag: str = "") -> None:
         self.eval_tag = eval_tag
 
-    # beartype enforces runtime types; we accept both sync/async flavours now
     @beartype
     def __call__(
         self,
         trajectory: Trajectory,
         config_file: Path | str,
-        page: PageLike,
-        client: CDPSessionLike,
+        page: Page | PseudoPage,
+        client: CDPSession,
     ) -> float:
-        """Concrete evaluators override this."""
         raise NotImplementedError
 
-    # helper: last action in trajectory
     @staticmethod
     def get_last_action(trajectory: Trajectory) -> Action:
         try:
+            # is_bearable(trajectory[-1], Action)
             last_action = trajectory[-1]
         except Exception:
             raise ValueError(
-                "The last element of trajectory should be an Action; "
-                "add a fake stop-action if needed."
+                "The last element of trajectory should be an action, add a fake stop action if needed"
             )
+
         return last_action  # type: ignore[return-value]
 
-    # helper: last state in trajectory (second-to-last element)
     @staticmethod
     def get_last_state(trajectory: Trajectory) -> StateInfo:
         try:
+            # is_bearable(trajectory[-2], StateInfo)
             last_state = trajectory[-2]
         except Exception:
             raise ValueError(
-                "The penultimate element of trajectory should be a StateInfo; "
-                "add a fake state if needed."
+                "The second last element of trajectory should be a state, add a fake stop action if needed"
             )
+
         return last_state  # type: ignore[return-value]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. String-based evaluator
-# ─────────────────────────────────────────────────────────────────────────────
-class StringEvaluator(Evaluator):
-    """Exact / must-include / fuzzy / UA string matching."""
 
-    # utilities ---------------------------------------------------------------
+class StringEvaluator(Evaluator):
+    """Check whether the answer is correct with:
+    exact match: the answer is exactly the same as the reference answer
+    must include: each phrase in the reference answer must be included in the answer
+    fuzzy match: the answer is similar to the reference answer, using LLM judge
+    """
+
     @staticmethod
     @beartype
     def clean_answer(answer: str) -> str:
@@ -112,11 +98,17 @@ class StringEvaluator(Evaluator):
     def must_include(ref: str, pred: str, tokenize: bool = False) -> float:
         clean_ref = StringEvaluator.clean_answer(ref)
         clean_pred = StringEvaluator.clean_answer(pred)
-
-        if tokenize and len(clean_ref) == 1 and len(word_tokenize(clean_ref)) == 1:
+        # tokenize the answer if the ref is a single word
+        # prevent false positive (e.g, 0)
+        if (
+            tokenize
+            and len(clean_ref) == 1
+            and len(word_tokenize(clean_ref)) == 1
+        ):
             tok_pred = word_tokenize(clean_pred)
             return float(clean_ref in tok_pred)
-        return float(clean_ref in clean_pred)
+        else:
+            return float(clean_ref in clean_pred)
 
     @staticmethod
     @beartype
@@ -128,20 +120,23 @@ class StringEvaluator(Evaluator):
     def ua_match(ref: str, pred: str, intent: str) -> float:
         return llm_ua_match(pred, ref, intent)
 
-    # main call ---------------------------------------------------------------
     def __call__(
         self,
         trajectory: Trajectory,
         config_file: Path | str,
-        page: PageLike | None = None,
-        client: CDPSessionLike | None = None,
+        page: Page | PseudoPage | None = None,
+        client: CDPSession | None = None,
     ) -> float:
         with open(config_file, "r") as f:
             configs = json.load(f)
 
-        pred = self.clean_answer(self.get_last_action(trajectory)["answer"])
-        score = 1.0
+        last_action = self.get_last_action(trajectory)
+        pred = self.clean_answer(last_action["answer"])
 
+        print(f"\n[StringEvaluator-debug] student answer → «{pred}»\n", flush=True)
+
+
+        score = 1.0
         for approach, value in configs["eval"]["reference_answers"].items():
             match approach:
                 case "exact_match":
@@ -155,14 +150,17 @@ class StringEvaluator(Evaluator):
                             pred=pred,
                             tokenize=(len(value) == 1),
                         )
-
                 case "fuzzy_match":
                     intent = configs["intent"]
                     if value == "N/A":
+                        # if the instruction only asks the model to generate N/A when encountering an unachievable task
+                        # without more concrete reasons
                         score *= self.exact_match(ref=value, pred=pred)
+                        # if the instruction also asks the model to generate the reason why the task is unachievable
+                        # this should be the default as it will prevent false positive N/A`
                         if score != 1:
-                            score = self.ua_match(
-                                intent=intent,
+                            score = 1.0 * self.ua_match(
+                                intent=configs["intent"],
                                 ref=configs["eval"]["string_note"],
                                 pred=pred,
                             )
@@ -174,156 +172,171 @@ class StringEvaluator(Evaluator):
                             )
         return score
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. URL evaluator
-# ─────────────────────────────────────────────────────────────────────────────
+
 class URLEvaluator(Evaluator):
-    """Check if the final URL matches the references."""
+    """
+    Looser URL match:
+    • host is ignored
+    • gold path must be a *prefix* of the predicted path
+    • query-string key/value logic unchanged
+    """
 
     @beartype
     def __call__(
         self,
         trajectory: Trajectory,
         config_file: Path | str,
-        page: PageLike,
-        client: CDPSessionLike | None = None,
+        page: Page | PseudoPage,
+        client: CDPSession | None = None,
     ) -> float:
+
         with open(config_file, "r") as f:
             configs = json.load(f)
 
         def clean_url(url: str) -> str:
             return str(url).rstrip("/")
 
-        def parse_url(url: str) -> tuple[str, dict[str, list[str]]]:
+        # ── helpers that DROP scheme + host ─────────────────
+        def split_url(url: str) -> tuple[str, dict[str, list[str]]]:
+            """
+            Return (path_without_trailing_slash, query-dict)
+            Hostname is intentionally discarded.
+            """
             parsed = urllib.parse.urlparse(url)
-            return parsed.netloc + parsed.path, urllib.parse.parse_qs(parsed.query)
+            path   = parsed.path.rstrip("/")
+            query  = urllib.parse.parse_qs(parsed.query)
+            return path, query
 
-        # prediction
-        pred = clean_url(page.url)  # type: ignore[attr-defined]
+        def split_urls(urls: list[str]) -> tuple[list[str], dict[str, set[str]]]:
+            paths, queries = [], collections.defaultdict(set)
+            for u in urls:
+                p, q = split_url(u)
+                paths.append(p)
+                for k, v in q.items():
+                    queries[k].update(v)
+            return paths, queries
+        # ────────────────────────────────────────────────────
 
-        # references
-        ref_urls = configs["eval"]["reference_url"].split(" |OR| ")
-        ref_urls = [clean_url(u) for u in ref_urls]
+        pred_path, pred_query = split_url(page.url)
+
+        ref_urls   = [clean_url(u) for u in configs["eval"]["reference_url"].split(" |OR| ")]
+        ref_paths, ref_queries = split_urls(ref_urls)
+
         rule = configs["eval"].get("url_note", "GOLD in PRED")
+        if rule != "GOLD in PRED":
+            raise ValueError(f"Unknown matching rule: {rule}")
 
-        # matching logic
-        if rule == "GOLD in PRED":
-            ref_paths, ref_queries = self._parse_urls(ref_urls, parse_url)
-            pred_path, pred_query = parse_url(pred)
+        # 1️⃣ path-prefix match (gold path is prefix of predicted path)
+        base_score = float(any(pred_path.startswith(gp) for gp in ref_paths))
 
-            base_ok = float(any(ref in pred_path for ref in ref_paths))
-            query_ok = 1.0
-            for k, vals in ref_queries.items():
-                query_ok *= float(any(v in pred_query.get(k, []) for v in vals))
-            return base_ok * query_ok
+        # 2️⃣ query-string match (unchanged logic)
+        query_score = 1.0
+        for k, gold_vals in ref_queries.items():
+            query_score *= float(
+                any(val in pred_query.get(k, []) for val in gold_vals)
+            )
 
-        raise ValueError(f"Unknown URL matching rule: {rule}")
+        score = base_score * query_score
 
-    # helper for URL parsing across a list
-    @staticmethod
-    def _parse_urls(urls, parse_fn):
-        paths, queries = [], collections.defaultdict(set)
-        for u in urls:
-            p, q = parse_fn(u)
-            paths.append(p)
-            for k, v in q.items():
-                queries[k].update(v)
-        return paths, queries
+        # optional debug print
+        # print("[URLEvaluator] gold paths:", ref_paths,
+        #       "pred path:", pred_path, "score:", score)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. HTML-content evaluator (uses JS locators / helper funcs)
-# ─────────────────────────────────────────────────────────────────────────────
+        return score
+
+
 class HTMLContentEvaluator(Evaluator):
-    """Verify that certain HTML contents appear on page(s)."""
+    """Check whether the contents appear in the page"""
 
     @beartype
     def __call__(
         self,
         trajectory: Trajectory,
         config_file: Path | str,
-        page: PageLike,
-        client: CDPSessionLike | None = None,
+        page: Page | PseudoPage,
+        client: CDPSession | None = None,
     ) -> float:
         with open(config_file, "r") as f:
             configs = json.load(f)
 
+        targets = configs["eval"]["program_html"]
+
         score = 1.0
-        for target in configs["eval"]["program_html"]:
-            url = self._resolve_url(target["url"], page)
-            locator = target["locator"]
+        for target in targets:
+            target_url: str = target["url"]  # which url to check
+            if target_url.startswith("func"):
+                func = target_url.split("func:")[1]
+                func = func.replace("__last_url__", page.url)
+                target_url = eval(func)
 
-            # navigate if required
-            if url != "last":
-                page.goto(url)                    # type: ignore[attr-defined]
-                time.sleep(3)  # TODO: remove sleep
+            locator: str = target["locator"]  # js element locator
 
-            selected = self._select_element(page, locator, target)
-            selected = html.unescape(selected)
+            # navigate to that url
+            if target_url != "last":
+                page.goto(target_url)
+                time.sleep(3)  # TODO [shuyanzh]: fix this hard-coded sleep
 
-            # scoring
-            score *= self._score_required_contents(
-                required=target["required_contents"], selected=selected
-            )
-        return score
-
-    # helper--resolve URL
-    @staticmethod
-    def _resolve_url(url: str, page: PageLike) -> str:
-        if url.startswith("func"):
-            func = url.split("func:")[1].replace("__last_url__", page.url)  # type: ignore[attr-defined]
-            return eval(func)
-        return url
-
-    # helper--select an element / HTML
-    @staticmethod
-    def _select_element(page: PageLike, locator: str, target: dict) -> str:
-        if not locator.strip():                       # whole page
-            return page.content()                     # type: ignore[attr-defined]
-
-        if locator.startswith(("document.", "[...document.")):
-            if "prep_actions" in target:
-                for act in target["prep_actions"]:
+            # empty, use the full page
+            if not locator.strip():
+                selected_element = page.content()
+            # use JS to select the element
+            elif locator.startswith("document.") or locator.startswith(
+                "[...document."
+            ):
+                if "prep_actions" in target:
                     try:
-                        page.evaluate(f"() => {act}") # type: ignore[attr-defined]
+                        for prep_action in target["prep_actions"]:
+                            page.evaluate(f"() => {prep_action}")
                     except Exception:
                         pass
-            try:
-                return str(
-                    page.evaluate(f"() => {locator}") # type: ignore[attr-defined]
-                    or ""
+                try:
+                    selected_element = str(page.evaluate(f"() => {locator}"))
+                    if not selected_element:
+                        selected_element = ""
+                except Exception:
+                    # the page is wrong, return empty
+                    selected_element = ""
+            # run program to call API
+            elif locator.startswith("func:"):  # a helper function
+                func = locator.split("func:")[1]
+                func = func.replace("__page__", "page")
+                selected_element = eval(func)
+            else:
+                raise ValueError(f"Unknown locator: {locator}")
+
+            selected_element = html.unescape(selected_element)
+
+            if "exact_match" in target["required_contents"]:
+                required_contents = target["required_contents"]["exact_match"]
+                cur_score = StringEvaluator.exact_match(
+                    ref=required_contents, pred=selected_element
                 )
-            except Exception:
-                return ""
-
-        if locator.startswith("func:"):
-            func = locator.split("func:")[1].replace("__page__", "page")
-            return eval(func)
-
-        raise ValueError(f"Unknown locator: {locator}")
-
-    # helper--score required contents
-    @staticmethod
-    def _score_required_contents(required: dict, selected: str) -> float:
-        score = 1.0
-        if "exact_match" in required:
-            score *= StringEvaluator.exact_match(
-                ref=required["exact_match"], pred=selected
-            )
-        elif "must_include" in required:
-            for content in required["must_include"]:
-                opts = content.split(" |OR| ")
-                ok = any(
-                    StringEvaluator.must_include(ref=o, pred=selected, tokenize=False)
-                    for o in opts
+                score *= float(cur_score)
+                # print(f"[exact match] {cur_score}, selected element: {selected_element}, required contents: {required_contents}")
+            elif "must_include" in target["required_contents"]:
+                required_contents = target["required_contents"]["must_include"]
+                assert isinstance(required_contents, list)
+                for content in required_contents:
+                    content_or = content.split(" |OR| ")
+                    cur_score = any(
+                        [
+                            StringEvaluator.must_include(
+                                ref=content,
+                                pred=selected_element,
+                                tokenize=False,
+                            )
+                            for content in content_or
+                        ]
+                    )
+                    score *= float(cur_score)
+                    # print(f"[must include] {cur_score}, selected element: {selected_element}, required contents: {content_or}")
+            else:
+                raise ValueError(
+                    f"Unknown required_contents: {target['required_contents'].keys()}"
                 )
-                score *= float(ok)
-        else:
-            raise ValueError(f"Unknown required_contents key(s): {required.keys()}")
         return score
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Evaluator combiner
-# ─────────────────────────────────────────────────────────────────────────────
+
 class EvaluatorComb:
     def __init__(self, evaluators: list[Evaluator]) -> None:
         self.evaluators = evaluators
@@ -333,25 +346,26 @@ class EvaluatorComb:
         self,
         trajectory: Trajectory,
         config_file: Path | str,
-        page: PageLike,
-        client: CDPSessionLike,
+        page: Page | PseudoPage,
+        client: CDPSession,
     ) -> float:
         score = 1.0
-        for ev in self.evaluators:
-            score *= ev(trajectory, config_file, page, client)
+        for evaluator in self.evaluators:
+            cur_score = evaluator(trajectory, config_file, page, client)
+            score *= cur_score
         return score
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Router - create composite evaluator from task config
-# ─────────────────────────────────────────────────────────────────────────────
+
 @beartype
 def evaluator_router(config_file: Path | str) -> EvaluatorComb:
+    """Router to get the evaluator class"""
     with open(config_file, "r") as f:
         configs = json.load(f)
 
+    eval_types = configs["eval"]["eval_types"]
     evaluators: list[Evaluator] = []
-    for etype in configs["eval"]["eval_types"]:
-        match etype:
+    for eval_type in eval_types:
+        match eval_type:
             case "string_match":
                 evaluators.append(StringEvaluator())
             case "url_match":
@@ -359,5 +373,6 @@ def evaluator_router(config_file: Path | str) -> EvaluatorComb:
             case "program_html":
                 evaluators.append(HTMLContentEvaluator())
             case _:
-                raise ValueError(f"Unsupported eval_type '{etype}'")
+                raise ValueError(f"eval_type {eval_type} is not supported")
+
     return EvaluatorComb(evaluators)

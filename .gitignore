@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+/trajectories
+
 # C extensions
 *.so
 

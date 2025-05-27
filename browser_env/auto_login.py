@@ -17,7 +17,7 @@ from browser_env.env_config import (
     SHOPPING_ADMIN,
 )
 
-HEADLESS = True
+HEADLESS = False
 SLOW_MO = 0
 
 
