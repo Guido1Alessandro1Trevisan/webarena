@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-/trajectories
+/trajectories/*
 !/trajectories/scores_progress.json
 
 
