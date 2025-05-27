@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 
 /trajectories
+!/trajectories/scores_progress.json
+
+
 
 # C extensions
 *.so
